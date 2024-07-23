@@ -1,6 +1,6 @@
 import "react-toastify/dist/ReactToastify.css";
 import { Card, CardBody, Heading } from "@chakra-ui/react";
-import { sendFeedback } from "../utils/sendFeedback";
+import { hasAllowedURLPrefix, sendFeedback } from "../utils/sendFeedback";
 import { Source } from "../types";
 
 export function SourceBubble({
@@ -8,19 +8,22 @@ export function SourceBubble({
   highlighted,
   onMouseEnter,
   onMouseLeave,
-  feedbackUrl,
+  feedbackUrls,
 }: {
   source: Source;
   highlighted: boolean;
   onMouseEnter: () => any;
   onMouseLeave: () => any;
-  feedbackUrl?: string;
+  feedbackUrls: string[];
 }) {
   return (
     <Card
       onClick={async () => {
         window.open(source.url, "_blank");
-        if (feedbackUrl) {
+        for (const feedbackUrl of feedbackUrls) {
+          if (!hasAllowedURLPrefix(feedbackUrl)) {
+            continue;
+          }
           await sendFeedback({
             feedbackUrl,
             value: source.url,

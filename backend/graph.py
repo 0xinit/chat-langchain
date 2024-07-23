@@ -1,10 +1,10 @@
 import os
+from collections import defaultdict
 from typing import Annotated, Literal, Sequence, TypedDict
 
 import weaviate
 from langchain_anthropic import ChatAnthropic
 from langchain_cohere import ChatCohere
-from langchain_community.vectorstores import Weaviate
 from langchain_core.documents import Document
 from langchain_core.language_models import LanguageModelLike
 from langchain_core.messages import (
@@ -22,8 +22,11 @@ from langchain_core.retrievers import BaseRetriever
 from langchain_core.runnables import ConfigurableField, RunnableConfig
 from langchain_fireworks import ChatFireworks
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
 from langchain_openai import ChatOpenAI
+from langchain_weaviate import WeaviateVectorStore
 from langgraph.graph import END, StateGraph, add_messages
+from langsmith import Client as LangsmithClient
 
 from backend.constants import WEAVIATE_DOCS_INDEX_NAME
 from backend.ingest import get_embeddings_model
@@ -97,11 +100,14 @@ Follow Up Input: {question}
 Standalone Question:"""
 
 
-OPENAI_MODEL_KEY = "openai_gpt_3_5_turbo"
+OPENAI_MODEL_KEY = "openai_gpt_4o_mini"
 ANTHROPIC_MODEL_KEY = "anthropic_claude_3_haiku"
 FIREWORKS_MIXTRAL_MODEL_KEY = "fireworks_mixtral"
 GOOGLE_MODEL_KEY = "google_gemini_pro"
 COHERE_MODEL_KEY = "cohere_command"
+GROQ_LLAMA_3_MODEL_KEY = "groq_llama_3"
+
+FEEDBACK_KEYS = ["user_score", "user_click"]
 
 
 def update_documents(
@@ -123,9 +129,12 @@ class AgentState(TypedDict):
     query: str
     documents: Annotated[list[Document], update_documents]
     messages: Annotated[list[BaseMessage], add_messages]
+    # for convenience in evaluations
+    answer: str
+    feedback_urls: dict[str, list[str]]
 
 
-gpt_3_5 = ChatOpenAI(model="gpt-3.5-turbo-0125", temperature=0, streaming=True)
+gpt_4o_mini = ChatOpenAI(model="gpt-4o-mini-2024-07-18", temperature=0, streaming=True)
 claude_3_haiku = ChatAnthropic(
     model="claude-3-haiku-20240307",
     temperature=0,
@@ -150,7 +159,12 @@ cohere_command = ChatCohere(
     temperature=0,
     cohere_api_key=os.environ.get("COHERE_API_KEY", "not_provided"),
 )
-llm = gpt_3_5.configurable_alternatives(
+groq_llama3 = ChatGroq(
+    model="llama3-70b-8192",
+    temperature=0,
+    groq_api_key=os.environ.get("GROQ_API_KEY", "not_provided"),
+)
+llm = gpt_4o_mini.configurable_alternatives(
     # This gives this field an id
     # When configuring the end runnable, we can then use this id to configure this field
     ConfigurableField(id="model_name"),
@@ -160,25 +174,33 @@ llm = gpt_3_5.configurable_alternatives(
         FIREWORKS_MIXTRAL_MODEL_KEY: fireworks_mixtral,
         GOOGLE_MODEL_KEY: gemini_pro,
         COHERE_MODEL_KEY: cohere_command,
+        GROQ_LLAMA_3_MODEL_KEY: groq_llama3,
     },
 ).with_fallbacks(
-    [gpt_3_5, claude_3_haiku, fireworks_mixtral, gemini_pro, cohere_command]
+    [
+        gpt_4o_mini,
+        claude_3_haiku,
+        fireworks_mixtral,
+        gemini_pro,
+        cohere_command,
+        groq_llama3,
+    ]
 )
 
 
 def get_retriever() -> BaseRetriever:
-    weaviate_client = weaviate.Client(
-        url=os.environ["WEAVIATE_URL"],
-        auth_client_secret=weaviate.AuthApiKey(
-            api_key=os.environ.get("WEAVIATE_API_KEY", "not_provided")
+    weaviate_client = weaviate.connect_to_wcs(
+        cluster_url=os.environ["WEAVIATE_URL"],
+        auth_credentials=weaviate.classes.init.Auth.api_key(
+            os.environ.get("WEAVIATE_API_KEY", "not_provided")
         ),
+        skip_init_checks=True,
     )
-    weaviate_client = Weaviate(
+    weaviate_client = WeaviateVectorStore(
         client=weaviate_client,
         index_name=WEAVIATE_DOCS_INDEX_NAME,
         text_key="text",
         embedding=get_embeddings_model(),
-        by_text=False,
         attributes=["source", "title"],
     )
     return weaviate_client.as_retriever(search_kwargs=dict(k=6))
@@ -243,8 +265,27 @@ def get_chat_history(messages: Sequence[BaseMessage]) -> Sequence[BaseMessage]:
     return chat_history
 
 
+def get_feedback_urls(config: RunnableConfig) -> dict[str, list[str]]:
+    ls_client = LangsmithClient()
+    run_id = config["configurable"].get("run_id")
+    if run_id is None:
+        return {}
+
+    tokens = ls_client.create_presigned_feedback_tokens(run_id, FEEDBACK_KEYS)
+    key_to_token_urls = defaultdict(list)
+
+    for token_idx, token in enumerate(tokens):
+        key_idx = token_idx % len(FEEDBACK_KEYS)
+        key = FEEDBACK_KEYS[key_idx]
+        key_to_token_urls[key].append(token.url)
+    return key_to_token_urls
+
+
 def synthesize_response(
-    state: AgentState, model: LanguageModelLike, prompt_template: str
+    state: AgentState,
+    config: RunnableConfig,
+    model: LanguageModelLike,
+    prompt_template: str,
 ) -> AgentState:
     prompt = ChatPromptTemplate.from_messages(
         [
@@ -265,18 +306,24 @@ def synthesize_response(
             ),
         }
     )
+    # finally, add feedback URLs so that users can leave feedback
+    feedback_urls = get_feedback_urls(config)
     return {
         "messages": [synthesized_response],
+        "answer": synthesized_response.content,
+        "feedback_urls": feedback_urls,
     }
 
 
-def synthesize_response_default(state: AgentState) -> AgentState:
-    return synthesize_response(state, llm, RESPONSE_TEMPLATE)
+def synthesize_response_default(
+    state: AgentState, config: RunnableConfig
+) -> AgentState:
+    return synthesize_response(state, config, llm, RESPONSE_TEMPLATE)
 
 
-def synthesize_response_cohere(state: AgentState) -> AgentState:
+def synthesize_response_cohere(state: AgentState, config: RunnableConfig) -> AgentState:
     model = llm.bind(documents=state["documents"])
-    return synthesize_response(state, model, COHERE_RESPONSE_TEMPLATE)
+    return synthesize_response(state, config, model, COHERE_RESPONSE_TEMPLATE)
 
 
 def route_to_response_synthesizer(

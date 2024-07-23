@@ -2,6 +2,7 @@
 import logging
 import os
 import re
+from typing import Optional
 
 import weaviate
 from bs4 import BeautifulSoup, SoupStrainer
@@ -9,9 +10,9 @@ from langchain.document_loaders import RecursiveUrlLoader, SitemapLoader
 from langchain.indexes import SQLRecordManager, index
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.utils.html import PREFIXES_TO_IGNORE_REGEX, SUFFIXES_TO_IGNORE_REGEX
-from langchain_community.vectorstores import Weaviate
 from langchain_core.embeddings import Embeddings
 from langchain_openai import OpenAIEmbeddings
+from langchain_weaviate import WeaviateVectorStore
 
 from backend.constants import WEAVIATE_DOCS_INDEX_NAME
 from backend.parser import langchain_docs_extractor
@@ -24,15 +25,23 @@ def get_embeddings_model() -> Embeddings:
     return OpenAIEmbeddings(model="text-embedding-3-small", chunk_size=200)
 
 
-def metadata_extractor(meta: dict, soup: BeautifulSoup) -> dict:
-    title = soup.find("title")
-    description = soup.find("meta", attrs={"name": "description"})
-    html = soup.find("html")
+def metadata_extractor(
+    meta: dict, soup: BeautifulSoup, title_suffix: Optional[str] = None
+) -> dict:
+    title_element = soup.find("title")
+    description_element = soup.find("meta", attrs={"name": "description"})
+    html_element = soup.find("html")
+    title = title_element.get_text() if title_element else ""
+    if title_suffix is not None:
+        title += title_suffix
+
     return {
         "source": meta["loc"],
-        "title": title.get_text() if title else "",
-        "description": description.get("content", "") if description else "",
-        "language": html.get("lang", "") if html else "",
+        "title": title,
+        "description": description_element.get("content", "")
+        if description_element
+        else "",
+        "language": html_element.get("lang", "") if html_element else "",
         **meta,
     }
 
@@ -49,6 +58,18 @@ def load_langchain_docs():
             ),
         },
         meta_function=metadata_extractor,
+    ).load()
+
+
+def load_langgraph_docs():
+    return SitemapLoader(
+        "https://langchain-ai.github.io/langgraph/sitemap.xml",
+        parsing_function=simple_extractor,
+        default_parser="lxml",
+        bs_kwargs={"parse_only": SoupStrainer(name=("article", "title"))},
+        meta_function=lambda meta, soup: metadata_extractor(
+            meta, soup, title_suffix=" | 🦜🕸️LangGraph"
+        ),
     ).load()
 
 
@@ -69,8 +90,15 @@ def load_langsmith_docs():
     ).load()
 
 
-def simple_extractor(html: str) -> str:
-    soup = BeautifulSoup(html, "lxml")
+def simple_extractor(html: str | BeautifulSoup) -> str:
+    if isinstance(html, str):
+        soup = BeautifulSoup(html, "lxml")
+    elif isinstance(html, BeautifulSoup):
+        soup = html
+    else:
+        raise ValueError(
+            "Input should be either BeautifulSoup object or an HTML string"
+        )
     return re.sub(r"\n\n+", "\n\n", soup.text).strip()
 
 
@@ -103,16 +131,16 @@ def ingest_docs():
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=4000, chunk_overlap=200)
     embedding = get_embeddings_model()
 
-    client = weaviate.Client(
-        url=WEAVIATE_URL,
-        auth_client_secret=weaviate.AuthApiKey(api_key=WEAVIATE_API_KEY),
+    client = weaviate.connect_to_wcs(
+        cluster_url=WEAVIATE_URL,
+        auth_credentials=weaviate.classes.init.Auth.api_key(WEAVIATE_API_KEY),
+        skip_init_checks=True,
     )
-    vectorstore = Weaviate(
+    vectorstore = WeaviateVectorStore(
         client=client,
         index_name=WEAVIATE_DOCS_INDEX_NAME,
         text_key="text",
         embedding=embedding,
-        by_text=False,
         attributes=["source", "title"],
     )
 
@@ -126,10 +154,15 @@ def ingest_docs():
     docs_from_api = load_api_docs()
     logger.info(f"Loaded {len(docs_from_api)} docs from API")
     docs_from_langsmith = load_langsmith_docs()
-    logger.info(f"Loaded {len(docs_from_langsmith)} docs from Langsmith")
+    logger.info(f"Loaded {len(docs_from_langsmith)} docs from LangSmith")
+    docs_from_langgraph = load_langgraph_docs()
+    logger.info(f"Loaded {len(docs_from_langgraph)} docs from LangGraph")
 
     docs_transformed = text_splitter.split_documents(
-        docs_from_documentation + docs_from_api + docs_from_langsmith
+        docs_from_documentation
+        + docs_from_api
+        + docs_from_langsmith
+        + docs_from_langgraph
     )
     docs_transformed = [doc for doc in docs_transformed if len(doc.page_content) > 10]
 
@@ -152,7 +185,11 @@ def ingest_docs():
     )
 
     logger.info(f"Indexing stats: {indexing_stats}")
-    num_vecs = client.query.aggregate(WEAVIATE_DOCS_INDEX_NAME).with_meta_count().do()
+    num_vecs = (
+        client.collections.get(WEAVIATE_DOCS_INDEX_NAME)
+        .aggregate.over_all()
+        .total_count
+    )
     logger.info(
         f"LangChain now has this many vectors: {num_vecs}",
     )
